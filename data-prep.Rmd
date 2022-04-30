@@ -1,0 +1,190 @@
+---
+title: "Data preparation"
+output:
+  pdf_document: default
+---
+
+# Instructions
+
+- You only need to submit the .Rmd of this file, not a PDF.
+
+- You should __comment__ your code clearly to show what you've done to prepare the data.
+
+- The purpose of this file is to use the data in the `data-raw` folder to create the data you will use in the report. The data you will use in the report should be saved in the `data` folder. It is good professional practice to make sure you're never directly modifying your raw data, but instead creating new datasets based on merges/manipulations that you need to reuse.
+
+- Make sure you've taken a look at the hints for the web scraping and census API. 
+
+- You may find the `write_rds()` function from the `readr` package helpful (it is loaded as part of the `tidyverse`).
+
+- You do not need to keep the structure below.
+
+# Set up
+
+```{r, libraries}
+# Set up any libraries you need
+library(tidyverse)
+library(polite)
+library(rvest)
+library(cancensus)
+library(haven)
+library(lubridate)
+```
+
+# Loading client data
+
+```{r}
+customer_device = read_rds("data-raw/cust_dev.Rds")
+customer = read_rds("data-raw/customer.Rds")
+customer_sleep = read_rds("data-raw/cust_sleep.Rds")
+device = read_rds("data-raw/device.Rds")
+```
+
+# Getting external data
+
+## Web scraping industry data
+
+```{r}
+url <- "https://fitnesstrackerinfohub.netlify.app/"
+
+# Make sure this code is updated appropriately to provide 
+# informative user_agent details
+target <- bow(url,
+              user_agent = "alex.yin@mail.utoronto.ca for STA303/1002 Final project",
+              force = TRUE)
+
+# Any details provided in the robots text on crawl delays and 
+# which agents are allowed to scrape
+target
+
+html <- scrape(target)
+
+device_data <- html %>% 
+  html_elements("table") %>% 
+  html_table() %>% 
+  pluck(1) # added, in case you're getting a list format
+```
+
+# Census API
+
+```{r}
+options(cancensus.api_key = "CensusMapper_12eb957142f321f121e2b74df3afe53a",
+        cancensus.cache_path = "cache") # this sets a folder for your cache
+
+
+# get all regions as at the 2016 Census (2020 not up yet)
+regions <- list_census_regions(dataset = "CA16")
+
+regions_filtered <-  regions %>% 
+  filter(level == "CSD") %>% # Figure out what CSD means in Census data
+  as_census_region_list()
+
+# This can take a while
+# We want to get household median income
+census_data_csd <- get_census(dataset='CA16', regions = regions_filtered,
+                          vectors=c("v_CA16_2397"), 
+                          level='CSD', geo_format = "sf")
+
+# Simplify to only needed variables
+median_income <- census_data_csd %>% 
+  as_tibble() %>% 
+  select(CSDuid = GeoUID, contains("median"), Population) %>% 
+  mutate(CSDuid = parse_number(CSDuid)) %>% 
+  rename(hhld_median_inc = 2)
+```
+
+
+# Postal Code Conversion
+
+```{r}
+dataset = read_rds("data-raw/break_glass_in_case_of_emergency.Rds")
+
+postcode <- dataset %>% 
+  select(PC, CSDuid)
+```
+
+# Merge data
+
+```{r}
+# merge customer data with device information
+merged_cust_data = customer %>% 
+  left_join(customer_device, by="cust_id") %>% 
+  left_join(device, by="dev_id") 
+
+# Merge postal code after removing duplication with median income
+merged_postalIncome  = postcode %>% 
+  distinct(PC, .keep_all = TRUE)%>% 
+  left_join(median_income, by="CSDuid")
+
+# Merge the above two datasets together
+merged_cust_all = merged_cust_data %>% 
+  left_join(merged_postalIncome, by=c("postcode"="PC")) %>% 
+  select(-postcode, -pronouns, -dev_id, -released)
+
+
+# Merge customer_sleep in the similar way
+merged_cust_sleep = customer_sleep %>% 
+  left_join(customer, by="cust_id") %>% 
+  left_join(customer_device, by="cust_id") %>% 
+  left_join(device, by="dev_id") %>% 
+  select(-pronouns, -dev_id, -released, -postcode)
+```
+
+# Data Cleaning
+
+```{r}
+# data cleaning for merged_cust_all
+merged_cust_all = merged_cust_all %>% 
+  # remove missing value and observations are intersex
+  filter(!is.na(sex) & sex != "Intersex") %>%
+  # Calculate age based on birth date
+  mutate(age = round(as.numeric(date(today()) - date(dob))/365, 0)) %>%
+  select(-dob) %>% 
+  # create skinColor variable to represent the corresponding skin tone for emoji_modifier
+  mutate(skinColor = case_when(emoji_modifier == "U+1F3FD" ~ "Medium",
+                               emoji_modifier == "U+1F3FC" ~ "Medium-light",
+                               emoji_modifier == "U+1F3FB" ~ "Light",
+                               emoji_modifier == "U+1F3FE" ~ "Medium-dark",
+                               emoji_modifier == "U+1F3FF" ~ "Dark",
+                               TRUE ~ "Unspecified"),
+         skin_color_dark = case_when(skinColor == "Dark" ~ 1, TRUE ~ 0),
+         skin_color_mediumDark = case_when(skinColor == "Medium-dark" ~ 1, TRUE ~ 0),
+         skin_color_medium = case_when(skinColor == "Medium" ~ 1, TRUE ~ 0),
+         skin_color_mediumLight = case_when(skinColor == "Medium-light" ~ 1, TRUE ~ 0),
+         skin_color_light = case_when(skinColor == "Light" ~ 1, TRUE ~ 0)) %>%
+  select(-emoji_modifier) %>% 
+  mutate(sex = case_when(sex == "Male" ~ 1, TRUE ~ 0),
+         new_customer = case_when(line == "Active" | line == "Advance" ~ 1,
+                                  TRUE ~ 0)) %>% 
+  select(-Population)
+
+
+# data cleaning for merged_cust_sleep
+merged_cust_sleep = merged_cust_sleep %>% 
+  # remove missing value and observations are intersex
+  filter(!is.na(sex) & sex != "Intersex") %>%
+  # Calculate age based on birth date
+  mutate(age = round(as.numeric(date(today()) - date(dob))/365, 0)) %>%
+  select(-dob) %>% 
+  # create skinColor variable to represent the corresponding skin tone for emoji_modifier
+  mutate(skinColor = case_when(emoji_modifier == "U+1F3FD" ~ "Medium",
+                               emoji_modifier == "U+1F3FC" ~ "Medium-light",
+                               emoji_modifier == "U+1F3FB" ~ "Light",
+                               emoji_modifier == "U+1F3FE" ~ "Medium-dark",
+                               emoji_modifier == "U+1F3FF" ~ "Dark", 
+                               TRUE ~ "Unspecified")) %>%
+  select(-emoji_modifier) %>% 
+  # rescale age ranged from 0 to 1
+  mutate(ageScale = scales::rescale(age)) %>% 
+  # Calculate the proportion of flags
+  mutate(flagProp = flags / duration) %>% 
+  # Calculate the average proportion of flags for different ages
+  group_by(age) %>% mutate(flagMean = mean(flagProp)) %>% ungroup()
+```
+
+```{r}
+# Output data to data folder
+write_rds(merged_cust_all, "data/merged_cust_all.Rds")
+write_rds(merged_cust_sleep, "data/merged_cust_sleep.Rds")
+write_rds(device_data, "data/device_data.Rds")
+```
+
